@@ -1454,7 +1454,10 @@ void BaseRealSenseNode::publishNitrosFrame(
     // The publisher D2D-copies the pixels into a GXF-owned buffer synchronously, so `f` (and the
     // frame-pool buffer gpu_ptr aliases) only needs to stay alive for the duration of this call.
     const size_t size_bytes = static_cast<size_t>(width) * height * bpp;
-    it->second->publish(gpu_ptr, width, height, size_bytes, encoding, header);
+    // Hand the frame over as a keep-alive: on an Isaac ROS release with WithReleaseCallback() the
+    // publisher borrows these very pixels, so the frame must outlive the message, not this call.
+    it->second->publish(gpu_ptr, width, height, size_bytes, encoding, header,
+                        std::make_shared<rs2::frame>(f));
 
     ROS_DEBUG_STREAM("NITROS " << (is_aligned_frame ? "aligned " : "") << STREAM_NAME(stream)
                      << " published ("

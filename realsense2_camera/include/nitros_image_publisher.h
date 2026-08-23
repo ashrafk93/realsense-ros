@@ -70,14 +70,21 @@ public:
     // gpu_src   : CUDA device pointer to the frame pixels (aliases the SDK frame buffer).
     // size_bytes: number of bytes to copy (width * height * bytes_per_pixel).
     // encoding  : sensor_msgs::image_encodings string matching nitros_format (e.g. "rgb8").
-    // The pixels are copied into a GXF-owned buffer and the copy is awaited before the message goes
-    // out, so the caller need not keep the frame alive after this returns.
+    // keep_alive: opaque handle that owns gpu_src (in practice a shared_ptr<rs2::frame>).
+    //
+    // Two paths, chosen at compile time by which Isaac ROS release this is built against:
+    //  * Isaac ROS >= 4.0, and keep_alive given: gpu_src is published as-is and keep_alive is held
+    //    until GXF releases the message, so the frame is never copied at all.
+    //  * Isaac ROS 3.2 (no WithReleaseCallback): the pixels are copied into a GXF-owned buffer and
+    //    the copy is awaited before the message goes out.
+    // Either way the caller need not keep the frame alive after this returns.
     void publish(const void * gpu_src,
                  uint32_t width,
                  uint32_t height,
                  size_t size_bytes,
                  const std::string & encoding,
-                 const std_msgs::msg::Header & header);
+                 const std_msgs::msg::Header & header,
+                 std::shared_ptr<void> keep_alive = nullptr);
 
 private:
     struct Impl;

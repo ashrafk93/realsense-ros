@@ -24,7 +24,10 @@
 #include <chrono>
 #include <cstdint>
 #include <exception>
+#include <functional>
+#include <memory>
 #include <optional>
+#include <type_traits>
 #include <utility>
 
 // cudaMemPool_t / cudaMallocFromPoolAsync (the stream-ordered allocator) need CUDA 11.2.
@@ -42,6 +45,43 @@ using nvidia::isaac_ros::nitros::NitrosImageBuilder;
 
 namespace
 {
+// Isaac ROS >= 4.0 adds NitrosImageBuilder::WithReleaseCallback(): GXF then calls us back instead of
+// cudaFree()ing the buffer, which means the SDK's own frame memory can be published with no copy at
+// all. Detect it rather than hard-coding a version, so one source tree takes the best path available
+// (3.2 keeps the device-to-device staging copy below).
+template <typename Builder, typename = void>
+struct has_release_callback : std::false_type {};
+template <typename Builder>
+struct has_release_callback<Builder, std::void_t<decltype(
+    std::declval<Builder &>().WithReleaseCallback(std::function<void()>{}))>> : std::true_type {};
+
+// Must stay a template: `if constexpr` only discards the untaken branch inside a template, so this
+// is what keeps the WithReleaseCallback() call from being compiled against Isaac ROS 3.2.
+template <typename Builder>
+std::optional<NitrosImage> buildBorrowed(const std_msgs::msg::Header & header,
+                                         const std::string & encoding,
+                                         uint32_t height,
+                                         uint32_t width,
+                                         void * gpu_data,
+                                         std::function<void()> on_release)
+{
+    if constexpr (has_release_callback<Builder>::value)
+    {
+        return Builder()
+               .WithHeader(header)
+               .WithEncoding(encoding)
+               .WithDimensions(height, width)
+               .WithGpuData(gpu_data)
+               .WithReleaseCallback(std::move(on_release))
+               .Build();
+    }
+    else
+    {
+        (void)header; (void)encoding; (void)height; (void)width; (void)gpu_data; (void)on_release;
+        return std::nullopt;   // this Isaac ROS release cannot borrow; caller falls back to copying
+    }
+}
+
 // How many publish attempts to wait between graph queries for subscribers (~0.3 s at 30 FPS).
 constexpr uint64_t SUBSCRIBER_CHECK_INTERVAL = 10;
 // Frames between reports of the accumulated publish cost (~3 s at 30 FPS).
@@ -249,9 +289,38 @@ void NitrosImagePublisher::publish(
     uint32_t height,
     size_t size_bytes,
     const std::string & encoding,
-    const std_msgs::msg::Header & header)
+    const std_msgs::msg::Header & header,
+    std::shared_ptr<void> keep_alive)
 {
     const auto t_start = std::chrono::steady_clock::now();
+
+    // Preferred path where the API exists: publish the SDK's buffer itself and hold the frame until
+    // GXF is done with it. The frame is complete by the time we get here, so there is nothing to
+    // await. Falls through to the copy below when the release-callback API is unavailable.
+    if (keep_alive)
+    {
+        std::optional<NitrosImage> borrowed;
+        try
+        {
+            borrowed = buildBorrowed<NitrosImageBuilder>(
+                header, encoding, height, width, const_cast<void *>(gpu_src),
+                [held = keep_alive]() mutable { held.reset(); });
+        }
+        catch (const std::exception & e)
+        {
+            RCLCPP_WARN_THROTTLE(_impl->logger, _impl->clock, WARN_THROTTLE_MS,
+                                 "NitrosImage Build (borrowed) failed: %s", e.what());
+            return;
+        }
+        if (borrowed)
+        {
+            _impl->pub->publish(std::move(*borrowed));
+            _impl->us_sum += std::chrono::duration<double, std::micro>(
+                std::chrono::steady_clock::now() - t_start).count();
+            ++_impl->frames;
+            return;
+        }
+    }
 
     // GXF will cudaFree() this buffer once downstream is done with it, so it must be a buffer we
     // own rather than the SDK's frame-pool memory.
